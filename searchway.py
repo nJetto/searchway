@@ -11,24 +11,35 @@ Usage:
   searchway -r /data -r ~      index specific roots (default: your home)
   searchway -q "report pdf"    search from the terminal
   searchway --reindex          wipe the index and rebuild it
+  searchway --no-rust          force the pure-Python scanner
   searchway --install          create a .desktop launcher
 
 Search syntax: words are ANDed, case-insensitive substring match on the
 file name. A word containing "/" is matched against the full path.
+Masks: "*" = any run of characters, "?" = exactly one. A mask must match the
+whole name, so "*.pdf" = names ending in .pdf, "img_??.jpg" = img_01.jpg ...
+Use "*word*" for "contains". A path mask matches the end of the full path.
+
+Optional speed-up: build the Rust walker in ./indexer (see README) and put
+"searchway-indexer" next to this script or in ~/.local/bin.
 
 Debian/Ubuntu deps:  sudo apt install python3-gi gir1.2-gtk-3.0
 """
 
 import argparse
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 
+VERSION = "0.2.0"
 APP_ID = "io.github.searchway"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "searchway"
 DB_PATH = CACHE_DIR / "index.db"
@@ -36,6 +47,7 @@ DEFAULT_ROOTS = [str(Path.home())]
 RESCAN_INTERVAL = 60       # seconds between background incremental scans
 RESULT_LIMIT = 1000
 FLUSH_EVERY = 20000        # rows per DB transaction while indexing
+USE_RUST = not os.environ.get("SEARCHWAY_NO_RUST")
 
 SKIP_NAMES = {".git", "node_modules", "__pycache__", ".cache"}
 SKIP_PATHS = {
@@ -81,7 +93,15 @@ def connect():
     con.executescript(SCHEMA)
     # Unicode-aware, case-insensitive substring test (SQLite LIKE is ASCII-only).
     con.create_function("contains", 2, lambda h, n: int(n in h.lower()), deterministic=True)
+    # Whole-string wildcard match for non-ASCII patterns (see _wild_like).
+    con.create_function("wmatch", 2, lambda h, p: int(_rx(p).fullmatch(h.lower()) is not None),
+                        deterministic=True)
     return con
+
+
+@lru_cache(maxsize=256)
+def _rx(pattern):
+    return re.compile(pattern, re.DOTALL)
 
 
 def _like(expr, word):
@@ -92,15 +112,38 @@ def _like(expr, word):
     return f"contains({expr}, ?)", word
 
 
+def _wild_like(expr, word, tail_only):
+    """Wildcard word (* = any run, ? = one char), anchored to the whole value.
+
+    With tail_only (path words) the start is free, only the end is anchored.
+    ASCII patterns use native LIKE; others use the Unicode-aware wmatch().
+    """
+    if word.isascii():
+        pat = "".join("%" if c == "*" else "_" if c == "?" else
+                      "\\" + c if c in "\\%_" else c for c in word)
+        return f"{expr} LIKE ? ESCAPE '\\'", ("%" + pat if tail_only else pat)
+    rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in word)
+    return f"wmatch({expr}, ?)", (".*" + rx if tail_only else rx)
+
+
 def build_query(text, sort="relevance", desc=False, limit=RESULT_LIMIT):
     words = text.lower().split()
     if not words:
         return None
     fts, where, wargs = [], [], []
     for w in words:
+        wild = "*" in w or "?" in w
         if "/" in w:
-            clause, arg = _like("(f.dir || '/' || f.name)", w)
+            full = "(f.dir || '/' || f.name)"
+            clause, arg = _wild_like(full, w, True) if wild else _like(full, w)
             where.append(clause); wargs.append(arg)
+        elif wild:
+            clause, arg = _wild_like("f.name", w, False)
+            where.append(clause); wargs.append(arg)
+            # Literal pieces of the mask can still use the trigram index.
+            for seg in re.split(r"[*?]+", w):
+                if len(seg) >= 3:
+                    fts.append('"' + seg.replace('"', '""') + '"')
         elif len(w) >= 3:                      # trigram index needs >= 3 chars
             fts.append('"' + w.replace('"', '""') + '"')
         else:
@@ -136,10 +179,29 @@ def search(con, text, **kw):
 # Indexer
 # --------------------------------------------------------------------------- #
 
+def find_scanner():
+    """Locate the optional Rust walker (searchway-indexer), or return None."""
+    candidates = [
+        os.environ.get("SEARCHWAY_INDEXER"),
+        str(Path(__file__).resolve().parent / "searchway-indexer"),
+        shutil.which("searchway-indexer"),
+        str(Path.home() / ".local/bin/searchway-indexer"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
 class Indexer(threading.Thread):
     def __init__(self, roots):
         super().__init__(daemon=True)
-        self.roots = [os.path.abspath(r) for r in roots]
+        absroots = sorted({os.path.abspath(r) for r in roots})
+        # Drop roots nested inside another root so nothing is walked twice.
+        self.roots = [r for r in absroots if not any(
+            r != o and r.startswith(o.rstrip("/") + "/") for o in absroots)]
+        self.backend = "python"
+        self.proc = None
         self.stop_evt = threading.Event()
         self.wake_evt = threading.Event()
         self.scanning = False
@@ -165,11 +227,123 @@ class Indexer(threading.Thread):
     def stop(self):
         self.stop_evt.set()
         self.wake_evt.set()
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
 
     def _under_roots(self, path):
         return any(path == r or path.startswith(r.rstrip("/") + "/") for r in self.roots)
 
     def scan(self, con):
+        """Prefer the Rust walker; fall back to the pure-Python one."""
+        exe = find_scanner() if USE_RUST else None
+        if exe:
+            try:
+                self._scan_rust(con, exe)
+                self.backend = "rust"
+                return
+            except (OSError, RuntimeError) as exc:
+                self.error = f"rust scanner failed ({exc}), using Python"
+        self._scan_python(con)
+        self.backend = "python"
+
+    def _scan_rust(self, con, exe):
+        """Run searchway-indexer and apply its records to the database.
+
+        Record = 5 NUL-terminated fields: dir, name, a, b, c
+          name != "": entry (a=is_dir, b=size, c=mtime)
+          name == "": marker (a=S start dir / E end dir, c=mtime / G gone dir)
+        Records of different directories may interleave, so a directory is only
+        written once its E marker has arrived (an interrupted walk never leaves
+        half a directory behind).
+        """
+        known = con.execute("SELECT path, mtime FROM dirs").fetchall()
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        fd, known_path = tempfile.mkstemp(prefix="known-", dir=CACHE_DIR)
+        rows, clear, dir_rows, gone = [], [], [], []
+        open_units, done = {}, set()
+        complete = False
+
+        def flush():
+            if not (rows or clear or dir_rows or gone):
+                return
+            clear.extend(gone)
+            con.executemany("DELETE FROM files WHERE dir=?", [(d,) for d in clear])
+            con.executemany(
+                "INSERT INTO files(dir, name, is_dir, size, mtime) VALUES (?,?,?,?,?)", rows)
+            con.executemany("INSERT OR REPLACE INTO dirs(path, mtime) VALUES (?,?)", dir_rows)
+            con.executemany("DELETE FROM dirs WHERE path=?", [(g,) for g in gone])
+            con.commit()
+            rows.clear(); clear.clear(); dir_rows.clear(); gone.clear()
+            self.total = con.execute("SELECT count(*) FROM files").fetchone()[0]
+
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                for path, mtime in known:
+                    fh.write(path.encode("utf-8") + b"\0" + str(mtime).encode() + b"\0")
+            cmd = [exe, "--known", known_path]
+            for r in self.roots:
+                cmd += ["--root", r]
+            for name in sorted(SKIP_NAMES):
+                cmd += ["--skip-name", name]
+            for path in sorted(SKIP_PATHS):
+                cmd += ["--skip-path", path]
+            self.proc = proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            tail, fields = b"", []
+            while True:
+                chunk = proc.stdout.read1(1 << 20)
+                if not chunk:
+                    break
+                parts = (tail + chunk).split(b"\0")
+                tail = parts.pop()                     # possibly incomplete last field
+                fields.extend(parts)
+                usable = len(fields) - len(fields) % 5
+                for i in range(0, usable, 5):
+                    d, name, a, b, c = fields[i:i + 5]
+                    try:
+                        d = d.decode("utf-8")
+                        if name:
+                            unit = open_units.get(d)
+                            if unit is not None:
+                                unit.append((d, name.decode("utf-8"), int(a == b"1"), int(b), int(c)))
+                        elif a == b"S":
+                            open_units[d] = []
+                        elif a == b"E":
+                            entries = open_units.pop(d, None)
+                            if entries is not None and d not in done:
+                                done.add(d)
+                                clear.append(d)
+                                dir_rows.append((d, int(c)))
+                                rows.extend(entries)
+                                if len(rows) >= FLUSH_EVERY:
+                                    flush()
+                        elif a == b"G":
+                            gone.append(d)
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                del fields[:usable]
+                if self.stop_evt.is_set():
+                    proc.terminate()
+                    break
+
+            err = proc.stderr.read().decode("utf-8", "replace").strip()
+            rc = proc.wait()
+            complete = rc == 0
+            flush()                                    # only fully finished directories
+            if self.stop_evt.is_set():
+                return
+            if not complete:
+                raise RuntimeError(f"scanner exited with code {rc}: {err}")
+        finally:
+            self.proc = None
+            try:
+                os.unlink(known_path)
+            except OSError:
+                pass
+        self.total = con.execute("SELECT count(*) FROM files").fetchone()[0]
+
+    def _scan_python(self, con):
         known = dict(con.execute("SELECT path, mtime FROM dirs"))
         seen = set()
         rows, clear, dir_rows = [], [], []
@@ -412,7 +586,7 @@ def run_gui(roots):
             ix = self.indexer
             state = "indexing..." if ix.scanning else "up to date"
             parts = [prefix] if prefix else []
-            parts.append(f"{ix.total:,} items indexed ({state})")
+            parts.append(f"{ix.total:,} items indexed ({state}, {ix.backend} scanner)")
             if ix.error:
                 parts.append(f"indexer error: {ix.error}")
             self.status.set_text("  |  ".join(parts))
@@ -528,13 +702,57 @@ def run_gui(roots):
 # Entry point
 # --------------------------------------------------------------------------- #
 
+HELP_EPILOG = f"""\
+search syntax (words are ANDed, case-insensitive):
+  report pdf        names containing both "report" and "pdf"
+  *.pdf             mask: * = any characters, ? = exactly one character
+  img_??.jpg        a mask must match the whole name; use *word* for "contains"
+  docs/*.txt        a word with "/" is matched against the end of the full path
+
+examples:
+  searchway                          open the search window
+  searchway -q "*.mp4"               print all .mp4 files and exit
+  searchway -r ~ -r /mnt/data        index two folders
+  searchway --reindex                rebuild the index from scratch
+
+keys in the window:
+  Enter           open the selected file      Ctrl+Enter    show it in Dolphin
+  Down            jump to the results         Ctrl+Shift+C  copy the full path
+  Ctrl+L          focus the search box        F5 / Ctrl+R   rescan now
+  Esc             clear the search, then close; right click for the context menu
+
+environment:
+  SEARCHWAY_INDEXER=PATH   use this searchway-indexer binary (Rust)
+  SEARCHWAY_NO_RUST=1      always use the Python indexer
+  XDG_CACHE_HOME           the index is stored in $XDG_CACHE_HOME/searchway
+                           (now: {CACHE_DIR})
+
+Uninstall: see the README ("Uninstall" section).
+"""
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Searchway - instant file search")
-    ap.add_argument("-r", "--root", action="append", help="directory to index (repeatable)")
-    ap.add_argument("-q", "--query", help="search from the terminal and exit")
-    ap.add_argument("--reindex", action="store_true", help="wipe the index first")
-    ap.add_argument("--install", action="store_true", help="create a .desktop launcher")
+    ap = argparse.ArgumentParser(
+        prog="searchway",
+        description="Searchway - instant file search for Linux (Wayland and X11).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=HELP_EPILOG,
+    )
+    ap.add_argument("-r", "--root", action="append", metavar="DIR",
+                    help="folder to index, can be repeated (default: your home folder)")
+    ap.add_argument("-q", "--query", metavar="TEXT",
+                    help="search from the terminal: print matching paths and exit")
+    ap.add_argument("--reindex", action="store_true",
+                    help="delete the index and rebuild it from scratch")
+    ap.add_argument("--install", action="store_true",
+                    help="create an application-menu launcher (.desktop file)")
+    ap.add_argument("--no-rust", action="store_true",
+                    help="do not use the Rust indexer, use the built-in Python one")
+    ap.add_argument("--version", action="version", version=f"searchway {VERSION}")
     args = ap.parse_args()
+    global USE_RUST
+    if args.no_rust:
+        USE_RUST = False
 
     if args.install:
         install_desktop()
@@ -550,7 +768,8 @@ def main():
         ix = Indexer(roots)
         t0 = time.perf_counter()
         ix.scan(con)                     # incremental: fast when nothing changed
-        print(f"# index ready: {ix.total:,} items ({time.perf_counter() - t0:.1f}s)", file=sys.stderr)
+        print(f"# index ready: {ix.total:,} items ({time.perf_counter() - t0:.1f}s, "
+              f"{ix.backend} scanner)", file=sys.stderr)
         for d, name, is_dir, _size, _mtime in search(con, args.query):
             print(os.path.join(d, name) + ("/" if is_dir else ""))
         return
