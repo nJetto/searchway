@@ -24,7 +24,7 @@ Native on **Wayland** and X11 (GTK 4 or GTK 3), tested with the KDE Plasma workf
 | Fedora | `sudo dnf install python3-gobject gtk4` (or `gtk3`) |
 | Arch | `sudo pacman -S python-gobject gtk4` (or `gtk3`) |
 
-Optional, for the Rust indexer: Rust 1.63+ (`sudo apt install cargo` on Debian/Ubuntu, `sudo dnf install cargo` on Fedora, `sudo pacman -S rust` on Arch). The Rust part has **no crate dependencies**, so building needs no network access beyond installing the toolchain.
+Optional, only if you build the Rust indexer yourself (not needed with the prebuilt binary from Releases): Rust 1.63+ (`sudo apt install cargo` on Debian/Ubuntu, `sudo dnf install cargo` on Fedora, `sudo pacman -S rust` on Arch). The Rust part has **no crate dependencies**, so building needs no network access beyond installing the toolchain.
 
 ## Quick start
 
@@ -44,7 +44,25 @@ searchway
 
 The first launch indexes your home folder in the background. You can start typing right away; results fill in as the index grows. Later launches are instant, and the index stays up to date on its own.
 
-**3. (Optional) Build the fast Rust indexer**
+**3. (Optional) Install the fast Rust indexer**
+
+The Rust indexer makes the first scan much faster. Without it Searchway uses its built-in Python indexer, so this step is optional.
+
+*Option A: prebuilt binary (no Rust needed)*
+
+Download `searchway-indexer-x86_64-linux` from the [Releases](../../releases) page, then install it:
+
+```bash
+cd ~/Downloads
+install -Dm755 searchway-indexer-x86_64-linux ~/.local/bin/searchway-indexer
+searchway-indexer --version
+```
+
+`install -Dm755` creates `~/.local/bin` if needed and sets the executable bit (browsers drop it from downloaded files). The binary is statically linked and works on any x86_64 Linux. On other architectures (ARM, ...) use Option B.
+
+If you downloaded the `.zip` / `.tar.gz` archive instead, the indexer is already inside, named `searchway-indexer`, next to `searchway.py`: nothing more to install, Searchway finds it there.
+
+*Option B: build from source*
 
 ```bash
 cd indexer
@@ -147,6 +165,8 @@ Searchway only **reads** your files. It never modifies, moves or deletes anythin
 | Results look stale or broken | run `searchway --reindex` |
 | Searching one or two characters feels slower | expected: the trigram index needs 3+ characters, so short queries scan the table |
 | A mask like `*` or `??` is slow | masks without a literal piece of 3+ characters cannot use the index, add one (`*.pdf` is fast) |
+| `searchway-indexer: Permission denied` | the executable bit is missing, reinstall it with `install -Dm755 ...` as shown above |
+| `Exec format error` when running the binary | it is built for x86_64 only, build it from source (Option B) |
 | `cargo build` fails | make sure Rust is 1.63 or newer (`rustc --version`); you can also keep using the Python indexer |
 | Want to force the Python indexer | run `searchway --no-rust` or set `SEARCHWAY_NO_RUST=1` |
 
