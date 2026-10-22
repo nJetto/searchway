@@ -1,7 +1,7 @@
 # Searchway
 
 Instant "search as you type" file finder for Linux, inspired by [Everything](https://www.voidtools.com/) on Windows.
-Native on **Wayland** and X11 (GTK3), tested with the KDE Plasma workflow in mind.
+Native on **Wayland** and X11 (GTK 4 or GTK 3), tested with the KDE Plasma workflow in mind.
 
 - Search results update as you type, even with millions of indexed files
 - Case-insensitive substring search, Unicode-aware (Cyrillic and other scripts work)
@@ -16,13 +16,13 @@ Native on **Wayland** and X11 (GTK3), tested with the KDE Plasma workflow in min
 
 - Python 3.8+
 - SQLite 3.34+ with FTS5 (any current distro ships this)
-- PyGObject and GTK 3
+- PyGObject and GTK 4 **or** GTK 3 (GTK 4 is used when installed, otherwise GTK 3)
 
 | Distro | Install dependencies |
 | --- | --- |
-| Debian / Ubuntu | `sudo apt install python3-gi gir1.2-gtk-3.0` |
-| Fedora | `sudo dnf install python3-gobject gtk3` |
-| Arch | `sudo pacman -S python-gobject gtk3` |
+| Debian / Ubuntu | `sudo apt install python3-gi gir1.2-gtk-4.0` (or `gir1.2-gtk-3.0`) |
+| Fedora | `sudo dnf install python3-gobject gtk4` (or `gtk3`) |
+| Arch | `sudo pacman -S python-gobject gtk4` (or `gtk3`) |
 
 Optional, for the Rust indexer: Rust 1.63+ (`sudo apt install cargo` on Debian/Ubuntu, `sudo dnf install cargo` on Fedora, `sudo pacman -S rust` on Arch). The Rust part has **no crate dependencies**, so building needs no network access beyond installing the toolchain.
 
@@ -117,6 +117,7 @@ searchway -q "report pdf"    search from the terminal and exit
 searchway --reindex          wipe the index and rebuild it from scratch
 searchway --install          create the .desktop launcher
 searchway --no-rust          ignore the Rust indexer and use the Python one
+searchway --gtk 3            force GTK 3 (or `--gtk 4`); default is GTK 4 when installed
 ```
 
 Run `searchway --help` any time for this list plus the search syntax, keyboard shortcuts and environment variables, and `searchway --version` to see the version.
@@ -138,7 +139,9 @@ Searchway only **reads** your files. It never modifies, moves or deletes anythin
 
 | Problem | Fix |
 | --- | --- |
-| `ValueError: Namespace Gtk not available` | install GTK 3 and PyGObject (see Requirements) |
+| `ValueError: Namespace Gtk not available` or `No GTK found` | install PyGObject and GTK 4 or GTK 3 (see Requirements) |
+| Which GTK version is running? | Searchway prints `searchway: using GTK 4` to the terminal on start |
+| The GTK 4 window misbehaves | run `searchway --gtk 3` (or set `SEARCHWAY_GTK=3`) and please open an issue |
 | `no such tokenizer: trigram` | your SQLite is older than 3.34, update your system |
 | A new file does not show up yet | wait up to a minute or press `F5` |
 | Results look stale or broken | run `searchway --reindex` |
