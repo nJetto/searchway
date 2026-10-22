@@ -96,6 +96,10 @@ Launching Searchway a second time does not open a second window. It brings the e
 
 ## Usage
 
+### Browsing
+
+With an empty search box the window lists the first 1,000 items of the whole index, sorted by the selected column (name by default). Click a header to change the order, for example **Modified** for a "recently changed files" view. The status bar always shows how many items are indexed.
+
 ### Search syntax
 
 | Query | Meaning |
@@ -136,9 +140,30 @@ searchway --reindex          wipe the index and rebuild it from scratch
 searchway --install          create the .desktop launcher
 searchway --no-rust          ignore the Rust indexer and use the Python one
 searchway --gtk 3            force GTK 3 (or `--gtk 4`); default is GTK 4 when installed
+searchway -x node_modules    do not index this folder (repeatable, see below)
 ```
 
 Run `searchway --help` any time for this list plus the search syntax, keyboard shortcuts and environment variables, and `searchway --version` to see the version.
+
+### Excluding folders
+
+Searchway indexes **everything** under your home folder (hidden folders, `.git`, `node_modules`, caches, the Trash), except virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`). To skip folders:
+
+```bash
+searchway -x node_modules -x ~/Games     # on the command line
+```
+
+or list them in `~/.config/searchway/exclude.txt`, one per line:
+
+```text
+# a name skips every folder with that name, anywhere
+node_modules
+.cache
+# an absolute path (or ~/...) skips just that folder
+~/.local/share/Trash
+```
+
+The excluded folder itself stays searchable, only its contents are left out. Items that were indexed earlier are removed on the next scan. Use the `-x` flag in the command of your KDE shortcut too, or prefer the exclude file, which every launch picks up.
 
 ## How it works
 
@@ -149,7 +174,7 @@ Two interchangeable indexers walk the disk:
 - **Rust** (`indexer/`, optional): a multi-threaded walker with zero dependencies. It receives the list of known folders, skips unchanged ones and streams only the changes to Searchway, which writes them to SQLite in batches.
 - **Python** (built in): the same algorithm, single-threaded. Used when the Rust binary is missing or fails.
 
-Skipped by default: `.git`, `node_modules`, `__pycache__`, `.cache`, the Trash, and virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`). Edit `SKIP_NAMES` and `SKIP_PATHS` at the top of the script to change this.
+Nothing is skipped by default except virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`), see [Excluding folders](#excluding-folders).
 
 Searchway only **reads** your files. It never modifies, moves or deletes anything outside its own cache folder.
 
@@ -165,6 +190,7 @@ Searchway only **reads** your files. It never modifies, moves or deletes anythin
 | Results look stale or broken | run `searchway --reindex` |
 | Searching one or two characters feels slower | expected: the trigram index needs 3+ characters, so short queries scan the table |
 | A mask like `*` or `??` is slow | masks without a literal piece of 3+ characters cannot use the index, add one (`*.pdf` is fast) |
+| Fewer items than another tool (FSearch, `find`) | older versions skipped `.git`, `node_modules`, `.cache` and the Trash; update to the latest version, then check your exclude list |
 | `searchway-indexer: Permission denied` | the executable bit is missing, reinstall it with `install -Dm755 ...` as shown above |
 | `Exec format error` when running the binary | it is built for x86_64 only, build it from source (Option B) |
 | `cargo build` fails | make sure Rust is 1.63 or newer (`rustc --version`); you can also keep using the Python indexer |
